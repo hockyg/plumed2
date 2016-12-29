@@ -22,6 +22,7 @@
 #include "Bias.h"
 #include "ActionRegister.h"
 #include "tools/Random.h"
+#include "tools/Matrix.h"
 #include "tools/File.h"
 #include "core/PlumedMain.h"
 #include "core/Atoms.h"
@@ -108,6 +109,7 @@ class EDS : public Bias{
   std::vector<double> coupling_rate;
   std::vector<double> coupling_accum;
   std::vector<double> means;
+  std::vector<double> means_old;
   std::vector<double> ssds;
   std::vector<Value*> outCoupling;
   std::string _irestartfilename;
@@ -131,6 +133,7 @@ class EDS : public Bias{
   Random rand;
   Value* valueBias;
   Value* valueForce2;
+  Matrix<double> covar;
 
 public:
   explicit EDS(const ActionOptions&);
@@ -182,6 +185,7 @@ max_coupling_grad(getNumberOfArguments(),0.0),
 coupling_rate(getNumberOfArguments(),1.0),
 coupling_accum(getNumberOfArguments(),1.0),
 means(getNumberOfArguments(),0.0),
+means_old(getNumberOfArguments(),0.0),
 ssds(getNumberOfArguments(),0.0),
 outCoupling(getNumberOfArguments(),NULL),
 _irestartfilename(""),
@@ -294,6 +298,12 @@ valueForce2(NULL)
           update_period/=2;
       }
 
+
+    }
+    if(simultaneous){
+        int ncvs = center.size();
+        covar.resize(ncvs,ncvs);
+        covar*=0;
 
     }
 
@@ -473,93 +483,187 @@ void EDS::calculate(){
 
   int b_finished_equil_flag = 1;
   double delta;
+  double deltaj,deltak;
 
   //assume forces already applied and saved
   
-  for(unsigned i=0;i<ncvs;++i){
-      //are we ramping to a constant value and not done equilibrating
-      if(update_period<0){
-          if(update_calls<fabs(update_period) && !freeze){
+  //first check if ramping or staying at constant bias
+  if(update_period<0){
+      if(update_calls<fabs(update_period) && !freeze){
+          for(unsigned i=0;i<ncvs;++i){
               current_coupling[i] += (target_coupling[i]-set_coupling[i])/fabs(update_period);
           }
-          //make sure we don't reset update calls
-          b_finished_equil_flag = 0;
-          continue;
-      } 
-      //not updating
-      else if(update_period==0){
-          continue;
       }
-
-      //if we aren't wating for the bias to equilibrate, collect data
-      if(!equilibration){
-          //Welford, West, and Hanso online variance method
-          delta = difference(i,means[i],getArgument(i));
-          means[i]+=delta/update_calls;
-          ssds[i]+=delta*difference(i,means[i],getArgument(i));
-      }
-      // equilibrating
-      else {
-          //check if we've reached the setpoint
-          if(coupling_rate[i]==0 || pow(current_coupling[i]-set_coupling[i],2)<pow(coupling_rate[i],2)) {
-             b_finished_equil_flag &= 1;
-          }
-          else{
-              current_coupling[i]+=coupling_rate[i];
-              b_finished_equil_flag = 0;
-          }
-      }
-      //Update max coupling range if allowed
-      if(!b_hard_coupling_range && fabs(current_coupling[i])>max_coupling_range[i]) {
-         max_coupling_range[i]*=coupling_range_increase_factor; 
-         max_coupling_grad[i]*=coupling_range_increase_factor; 
-      }
+      //make sure we don't reset update calls
+      b_finished_equil_flag = 0;
+  } 
+  //not updating
+  else if(update_period==0){
   }
+  else{
+      if(simultaneous){
+          for(unsigned i=0;i<ncvs;++i){
+              //are we ramping to a constant value and not done equilibrating
+        
+              //if we aren't wating for the bias to equilibrate, collect data
+              if(!equilibration){
+                  //Welford, West, and Hanso online variance method
+                  //compute covariance in two passes, only do on first cv
+                  if(i==0){
+                      for(unsigned j=0;j<ncvs;++j){
+                          means_old[j] = means[j];
+                          delta = difference(j,means[j],getArgument(j));
+                          means[j]+=delta/update_calls;
+                          //compute standard deviations, to be compared with diagonal elements of covar matrix (need to divide by update_calls-1 probably)
+                          ssds[j]+=delta*difference(j,means[j],getArgument(j));
+                      }
+                      for(unsigned j=0;j<ncvs;++j){
+                          deltaj = difference(j,means_old[j],getArgument(j));
+                          for(unsigned k=j;k<ncvs;++k){
+                              deltak = difference(k,means_old[k],getArgument(k));
+                              covar(j,k)=( covar(j,k)*(update_calls-1)+((double)update_calls-1)/update_calls*deltaj*deltak )/update_calls;
+//                              if(k==j) printf("%i %i %i %f %f %f\n",update_calls,j,k,deltaj,deltak,covar(j,k));
+                              covar(k,j)=covar(j,k);
+                          }
+                      }
+                  }
+              }
+              // equilibrating
+              else {
+                  //check if we've reached the setpoint
+                  if(coupling_rate[i]==0 || pow(current_coupling[i]-set_coupling[i],2)<pow(coupling_rate[i],2)) {
+                     b_finished_equil_flag &= 1;
+                  }
+                  else{
+                      current_coupling[i]+=coupling_rate[i];
+                      b_finished_equil_flag = 0;
+                  }
+              }
+              //Update max coupling range if allowed
+              if(!b_hard_coupling_range && fabs(current_coupling[i])>max_coupling_range[i]) {
+                 max_coupling_range[i]*=coupling_range_increase_factor; 
+                 max_coupling_grad[i]*=coupling_range_increase_factor; 
+              }
+          }
+        
+          //reduce all the flags 
+          if(equilibration && b_finished_equil_flag) {
+            equilibration = false;
+            update_calls = 0;
+          }
+        
+          //Now we update coupling constant, if necessary
+          if(!equilibration && update_period > 0 && update_calls == update_period && !freeze) {
+            double step_size = 0;
+            double tmp;
+            for(unsigned i=0;i<ncvs;++i){
+               //calulcate step size
+               double alpha_grad = 0;
+               //check calculation by compariance std deviation to diagonal elements. Agrees.
+               //printf("%i %f %f\n",i,ssds[i]/(update_calls-1),covar(i,i));
+               for(unsigned j=0;j<ncvs;++j){
+                   alpha_grad += (means[j]-center[j])*covar(j,i);
+               }
+               step_size = 2*alpha_grad/kbt/center[i];
 
-  //reduce all the flags 
-  if(equilibration && b_finished_equil_flag) {
-    equilibration = false;
-    update_calls = 0;
+               //check if the step_size exceeds maximum possible gradient
+               step_size = copysign(fmin(fabs(step_size), max_coupling_grad[i]), step_size);
+        
+               //reset means/vars
+               means[i] = 0;
+               ssds[i] = 0;
+        
+              //multidimesional stochastic step
+               coupling_accum[i] += step_size * step_size;
+               //equation 5 in White and Voth, JCTC 2014
+               //no negative sign because it's in step_size
+               set_coupling[i] += max_coupling_range[i]/sqrt(coupling_accum[i])*step_size;
+               coupling_rate[i] = (set_coupling[i]-current_coupling[i])/update_period;
+            }
+            covar*=0;
+        
+            update_calls = 0;
+            avg_coupling_count++;
+            equilibration = true; //back to equilibration now
+          } //close update if
+
+      }
+      else{
+          //do standard eds recipe
+          for(unsigned i=0;i<ncvs;++i){
+              //are we ramping to a constant value and not done equilibrating
+        
+              //if we aren't wating for the bias to equilibrate, collect data
+              if(!equilibration){
+                  //Welford, West, and Hanso online variance method
+                  delta = difference(i,means[i],getArgument(i));
+                  means[i]+=delta/update_calls;
+                  ssds[i]+=delta*difference(i,means[i],getArgument(i));
+              }
+              // equilibrating
+              else {
+                  //check if we've reached the setpoint
+                  if(coupling_rate[i]==0 || pow(current_coupling[i]-set_coupling[i],2)<pow(coupling_rate[i],2)) {
+                     b_finished_equil_flag &= 1;
+                  }
+                  else{
+                      current_coupling[i]+=coupling_rate[i];
+                      b_finished_equil_flag = 0;
+                  }
+              }
+              //Update max coupling range if allowed
+              if(!b_hard_coupling_range && fabs(current_coupling[i])>max_coupling_range[i]) {
+                 max_coupling_range[i]*=coupling_range_increase_factor; 
+                 max_coupling_grad[i]*=coupling_range_increase_factor; 
+              }
+          }
+        
+          //reduce all the flags 
+          if(equilibration && b_finished_equil_flag) {
+            equilibration = false;
+            update_calls = 0;
+          }
+        
+          //Now we update coupling constant, if necessary
+          if(!equilibration && update_period > 0 && update_calls == update_period && !freeze) {
+            double step_size = 0;
+            double tmp;
+            for(unsigned i=0;i<ncvs;++i){
+               //calulcate step size
+               tmp = 2. * (means[i]/center[i] - 1) * ssds[i] / (update_calls - 1);
+               step_size = tmp / kbt;
+        
+               //check if the step_size exceeds maximum possible gradient
+               step_size = copysign(fmin(fabs(step_size), max_coupling_grad[i]), step_size);
+        
+               //reset means/vars
+               means[i] = 0;
+               ssds[i] = 0;
+        
+              //multidimesional stochastic step
+              if(ncvs == 1 || (rand.RandU01() < (1. / ncvs) ) ) {
+        	    coupling_accum[i] += step_size * step_size;
+                    //equation 5 in White and Voth, JCTC 2014
+        	    //no negative sign because it's in step_size
+                    set_coupling[i] += max_coupling_range[i]/sqrt(coupling_accum[i])*step_size;
+                    coupling_rate[i] = (set_coupling[i]-current_coupling[i])/update_period;
+        //            coupling_rate[i] = copysign( fmin(fabs(coupling_rate[i]),
+        //                                            max_coupling_rate[i])
+        //                                          ,coupling_rate[i]);
+                } else {
+                    //do not change the bias
+                    coupling_rate[i] = 0;
+                }
+        
+        
+           }
+        
+            update_calls = 0;
+            avg_coupling_count++;
+            equilibration = true; //back to equilibration now
+          } //close update if
+     }
   }
-
-  //Now we update coupling constant, if necessary
-  if(!equilibration && update_period > 0 && update_calls == update_period && !freeze) {
-    double step_size = 0;
-    double tmp;
-    for(unsigned i=0;i<ncvs;++i){
-       //calulcate step size
-       tmp = 2. * (means[i]/center[i] - 1) * ssds[i] / (update_calls - 1);
-       step_size = tmp / kbt;
-
-       //check if the step_size exceeds maximum possible gradient
-       step_size = copysign(fmin(fabs(step_size), max_coupling_grad[i]), step_size);
-
-       //reset means/vars
-       means[i] = 0;
-       ssds[i] = 0;
-
-      //multidimesional stochastic step
-      if(ncvs == 1 || (rand.RandU01() < (1. / ncvs) ) ) {
-	    coupling_accum[i] += step_size * step_size;
-            //equation 5 in White and Voth, JCTC 2014
-	    //no negative sign because it's in step_size
-            set_coupling[i] += max_coupling_range[i]/sqrt(coupling_accum[i])*step_size;
-            coupling_rate[i] = (set_coupling[i]-current_coupling[i])/update_period;
-//            coupling_rate[i] = copysign( fmin(fabs(coupling_rate[i]),
-//                                            max_coupling_rate[i])
-//                                          ,coupling_rate[i]);
-        } else {
-            //do not change the bias
-            coupling_rate[i] = 0;
-        }
-
-
-   }
-
-    update_calls = 0;
-    avg_coupling_count++;
-    equilibration = true; //back to equilibration now
-  } //close update if
 
   //pass couplings out so they are accessible
   for(unsigned i=0;i<ncvs;++i){
