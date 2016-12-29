@@ -116,6 +116,7 @@ class EDS : public Bias{
   IFile irestartfile_;
   bool adaptive;
   bool freeze;
+  bool simultaneous;
   bool equilibration;
   bool ramp;
   bool restart;
@@ -162,6 +163,7 @@ void EDS::registerKeywords(Keywords& keys){
 
    keys.addFlag("RAMP",false,"Slowly increase bias constant to a fixed value");
    keys.addFlag("FREEZE",false,"Fix bias at current level (only used for restarting). Can also set PERIOD=0 if not using EDSRESTART.");
+   keys.addFlag("SIMULTANEOUS",false,"Adjust bias simultaneously using covariance matrix. Otherwise choose variable randomly.");
    keys.addFlag("EDSRESTART",false,"Get settings from IRESTARTFILE");
 
    keys.addOutputComponent("bias","default","the instantaneous value of the bias potential");
@@ -192,6 +194,7 @@ adaptive(true),
 equilibration(true),
 ramp(false),
 freeze(false),
+simultaneous(false),
 restart(false),
 b_write_restart(false),
 seed(0),
@@ -227,6 +230,7 @@ valueForce2(NULL)
   parse("ORESTARTFILE",_orestartfilename);
   parseFlag("RAMP",ramp);
   parseFlag("FREEZE",freeze);
+  parseFlag("SIMULTANEOUS",simultaneous);
   parseFlag("EDSRESTART",restart);
   parse("IRESTARTFILE",_irestartfilename);
   parse("ORESTARTFILE",_orestartfilename);
