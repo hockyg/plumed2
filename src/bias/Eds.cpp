@@ -565,6 +565,8 @@ void EDS::calculate(){
                    alpha_grad += (means[j]-center[j])*covar(j,i);
                }
                step_size = 2*alpha_grad/kbt/center[i];
+               //don't have to use divided by center, which allows targetting to zero. However, means that rate has to be tuned more carefully for multiple cvs.
+               //step_size = 2*alpha_grad/kbt;
 
                //check if the step_size exceeds maximum possible gradient
                step_size = copysign(fmin(fabs(step_size), max_coupling_grad[i]), step_size);
