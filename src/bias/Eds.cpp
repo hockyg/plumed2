@@ -119,6 +119,7 @@ class EDS : public Bias{
   bool adaptive;
   bool freeze;
   bool simultaneous;
+  bool lm;
   bool equilibration;
   bool ramp;
   bool restart;
@@ -167,6 +168,7 @@ void EDS::registerKeywords(Keywords& keys){
    keys.addFlag("RAMP",false,"Slowly increase bias constant to a fixed value");
    keys.addFlag("FREEZE",false,"Fix bias at current level (only used for restarting). Can also set PERIOD=0 if not using EDSRESTART.");
    keys.addFlag("SIMULTANEOUS",false,"Adjust bias simultaneously using covariance matrix. Otherwise choose variable randomly.");
+   keys.addFlag("LM",false,"Use Levenberg-Marquadt algorithm along with simulatneous keyword. Otherwise use gradient descent.");
    keys.addFlag("EDSRESTART",false,"Get settings from IRESTARTFILE");
 
    keys.addOutputComponent("bias","default","the instantaneous value of the bias potential");
@@ -199,6 +201,7 @@ equilibration(true),
 ramp(false),
 freeze(false),
 simultaneous(false),
+lm(false),
 restart(false),
 b_write_restart(false),
 seed(0),
@@ -235,10 +238,12 @@ valueForce2(NULL)
   parseFlag("RAMP",ramp);
   parseFlag("FREEZE",freeze);
   parseFlag("SIMULTANEOUS",simultaneous);
+  parseFlag("LM",lm);
   parseFlag("EDSRESTART",restart);
   parse("IRESTARTFILE",_irestartfilename);
   parse("ORESTARTFILE",_orestartfilename);
   checkRead();
+
   if(restart){
       log.printf("  reading all simulation information from file: %s\n",_irestartfilename.c_str());
       read_irestart();
@@ -258,12 +263,14 @@ valueForce2(NULL)
       }
       log.printf("\n");
     
-      log.printf("  with initial ranges / rates:\n");
-      for(unsigned i=0;i<max_coupling_range.size();i++) {
-          //this is just an empirical guess. Bigger range, bigger grads. Less frequent updates, bigger changes
-          max_coupling_range[i]*=kbt;
-          max_coupling_grad[i] = max_coupling_range[i]*update_period/100.;
-          log.printf("    %f / %f\n",max_coupling_range[i],max_coupling_grad[i]);
+      if(!lm) {
+          log.printf("  with initial ranges / rates:\n");
+          for(unsigned i=0;i<max_coupling_range.size();i++) {
+              //this is just an empirical guess. Bigger range, bigger grads. Less frequent updates, bigger changes
+              max_coupling_range[i]*=kbt;
+              max_coupling_grad[i] = max_coupling_range[i]*update_period/100.;
+              log.printf("    %f / %f\n",max_coupling_range[i],max_coupling_grad[i]);
+          }
       }
     
       if(seed>0){
@@ -300,11 +307,18 @@ valueForce2(NULL)
 
 
     }
+
     if(simultaneous){
         int ncvs = center.size();
         covar.resize(ncvs,ncvs);
         covar*=0;
-
+        log.printf("  Updating bias for multiple cvs simultaneously using covariance matrix\n");
+        if(lm){
+            log.printf("  ...and Levenberg-Marquadt algorithm with initial mixing paramter %f\n",max_coupling_range[0]);
+        }
+    }
+    if(lm && ! simultaneous){
+      error("Levenberg-Marquadt algorithm can only be enabled with SIMULTANEOUS adjustment of bias");
     }
 
     if(freeze){
