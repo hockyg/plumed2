@@ -111,6 +111,8 @@ class EDS : public Bias{
   std::vector<double> means;
   std::vector<double> means_old;
   std::vector<double> ssds;
+  std::vector<double> differences;
+  std::vector<double> alpha_grad_vec;
   std::vector<Value*> outCoupling;
   std::string _irestartfilename;
   std::string _orestartfilename;
@@ -135,6 +137,8 @@ class EDS : public Bias{
   Value* valueBias;
   Value* valueForce2;
   Matrix<double> covar;
+  Matrix<double> covar2;
+  Matrix<double> lm_inv;
 
 public:
   explicit EDS(const ActionOptions&);
@@ -312,8 +316,14 @@ valueForce2(NULL)
         int ncvs = center.size();
         covar.resize(ncvs,ncvs);
         covar*=0;
+        differences.resize(ncvs);
+        alpha_grad_vec.resize(ncvs);
         log.printf("  Updating bias for multiple cvs simultaneously using covariance matrix\n");
         if(lm){
+            lm_inv.resize(ncvs,ncvs);
+            lm_inv*=0;
+            covar2.resize(ncvs,ncvs);
+            covar2*=0;
             log.printf("  ...and Levenberg-Marquadt algorithm with initial mixing paramter %f\n",max_coupling_range[0]);
         }
     }
@@ -527,6 +537,7 @@ void EDS::calculate(){
                       for(unsigned j=0;j<ncvs;++j){
                           means_old[j] = means[j];
                           delta = difference(j,means[j],getArgument(j));
+                          //differences[j] = delta;
                           means[j]+=delta/update_calls;
                           //compute standard deviations, to be compared with diagonal elements of covar matrix (need to divide by update_calls-1 probably)
                           ssds[j]+=delta*difference(j,means[j],getArgument(j));
@@ -539,6 +550,9 @@ void EDS::calculate(){
 //                              if(k==j) printf("%i %i %i %f %f %f\n",update_calls,j,k,deltaj,deltak,covar(j,k));
                               covar(k,j)=covar(j,k);
                           }
+                      }
+                      if(lm){
+                          mult(covar,covar,covar2);
                       }
                   }
               }
@@ -570,15 +584,17 @@ void EDS::calculate(){
           if(!equilibration && update_period > 0 && update_calls == update_period && !freeze) {
             double step_size = 0;
             double tmp;
+            for(unsigned i=0;i<ncvs;++i) differences[i]=means[i]-center[i];
+            mult(covar,differences,alpha_grad_vec);
             for(unsigned i=0;i<ncvs;++i){
                //calulcate step size
-               double alpha_grad = 0;
+               //double alpha_grad = 0;
                //check calculation by compariance std deviation to diagonal elements. Agrees.
                //printf("%i %f %f\n",i,ssds[i]/(update_calls-1),covar(i,i));
-               for(unsigned j=0;j<ncvs;++j){
-                   alpha_grad += (means[j]-center[j])*covar(j,i);
-               }
-               step_size = 2*alpha_grad/kbt/center[i];
+               //for(unsigned j=0;j<ncvs;++j){
+               //    alpha_grad += (means[j]-center[j])*covar(j,i);
+               //}
+               step_size = 2*alpha_grad_vec[i]/kbt/center[i];
                //don't have to use divided by center, which allows targetting to zero. However, means that rate has to be tuned more carefully for multiple cvs.
                //step_size = 2*alpha_grad/kbt;
 
