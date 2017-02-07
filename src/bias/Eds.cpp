@@ -113,6 +113,7 @@ class EDS : public Bias{
   std::vector<double> ssds;
   std::vector<double> differences;
   std::vector<double> alpha_grad_vec;
+  std::vector<double> step_size_vec;
   std::vector<Value*> outCoupling;
   std::string _irestartfilename;
   std::string _orestartfilename;
@@ -132,6 +133,7 @@ class EDS : public Bias{
   int update_period;
   double kbt;
   double coupling_range_increase_factor;
+  double lm_mixing_par;
   int b_hard_coupling_range;
   Random rand;
   Value* valueBias;
@@ -173,6 +175,7 @@ void EDS::registerKeywords(Keywords& keys){
    keys.addFlag("FREEZE",false,"Fix bias at current level (only used for restarting). Can also set PERIOD=0 if not using EDSRESTART.");
    keys.addFlag("SIMULTANEOUS",false,"Adjust bias simultaneously using covariance matrix. Otherwise choose variable randomly.");
    keys.addFlag("LM",false,"Use Levenberg-Marquadt algorithm along with simulatneous keyword. Otherwise use gradient descent.");
+   keys.addFlag("LM_MIXING","1","Initial mixing parameter when using Levenberg-Marquadt minimization.");
    keys.addFlag("EDSRESTART",false,"Get settings from IRESTARTFILE");
 
    keys.addOutputComponent("bias","default","the instantaneous value of the bias potential");
@@ -199,6 +202,7 @@ _orestartfilename(""),
 update_period(0),
 kbt(0.0),
 coupling_range_increase_factor(1.25),
+lm_mixing_par(1.0),
 b_hard_coupling_range(0),
 adaptive(true),
 equilibration(true),
@@ -238,6 +242,7 @@ valueForce2(NULL)
   parse("PERIOD",update_period);
   parse("TEMP",temp);
   parse("SEED",seed);
+  parse("LM_MIXING",lm_mixing_par);
   parse("ORESTARTFILE",_orestartfilename);
   parseFlag("RAMP",ramp);
   parseFlag("FREEZE",freeze);
@@ -267,14 +272,12 @@ valueForce2(NULL)
       }
       log.printf("\n");
     
-      if(!lm) {
-          log.printf("  with initial ranges / rates:\n");
-          for(unsigned i=0;i<max_coupling_range.size();i++) {
-              //this is just an empirical guess. Bigger range, bigger grads. Less frequent updates, bigger changes
-              max_coupling_range[i]*=kbt;
-              max_coupling_grad[i] = max_coupling_range[i]*update_period/100.;
-              log.printf("    %f / %f\n",max_coupling_range[i],max_coupling_grad[i]);
-          }
+      log.printf("  with initial ranges / rates:\n");
+      for(unsigned i=0;i<max_coupling_range.size();i++) {
+          //this is just an empirical guess. Bigger range, bigger grads. Less frequent updates, bigger changes
+          max_coupling_range[i]*=kbt;
+          max_coupling_grad[i] = max_coupling_range[i]*update_period/100.;
+          log.printf("    %f / %f\n",max_coupling_range[i],max_coupling_grad[i]);
       }
     
       if(seed>0){
@@ -318,13 +321,14 @@ valueForce2(NULL)
         covar*=0;
         differences.resize(ncvs);
         alpha_grad_vec.resize(ncvs);
+        step_size_vec.resize(ncvs);
         log.printf("  Updating bias for multiple cvs simultaneously using covariance matrix\n");
         if(lm){
             lm_inv.resize(ncvs,ncvs);
             lm_inv*=0;
             covar2.resize(ncvs,ncvs);
             covar2*=0;
-            log.printf("  ...and Levenberg-Marquadt algorithm with initial mixing paramter %f\n",max_coupling_range[0]);
+            log.printf("  ...and Levenberg-Marquadt algorithm with initial mixing paramter %f\n",lm_mixing_par);
         }
     }
     if(lm && ! simultaneous){
@@ -586,37 +590,59 @@ void EDS::calculate(){
             double tmp;
             for(unsigned i=0;i<ncvs;++i) differences[i]=means[i]-center[i];
             mult(covar,differences,alpha_grad_vec);
-            for(unsigned i=0;i<ncvs;++i){
-               //calulcate step size
-               //double alpha_grad = 0;
-               //check calculation by compariance std deviation to diagonal elements. Agrees.
-               //printf("%i %f %f\n",i,ssds[i]/(update_calls-1),covar(i,i));
-               //for(unsigned j=0;j<ncvs;++j){
-               //    alpha_grad += (means[j]-center[j])*covar(j,i);
-               //}
-               step_size = 2*alpha_grad_vec[i]/kbt/center[i];
-               //don't have to use divided by center, which allows targetting to zero. However, means that rate has to be tuned more carefully for multiple cvs.
-               //step_size = 2*alpha_grad/kbt;
+            if(lm){
+                for(unsigned i=0;i<ncvs;++i) {
+                    covar2[i][i]+=lm_mixing_par;
+                }
+                Invert(covar2,lm_inv);
+                // alpha += inv(covar*covar+ lambda diag(covar*covar))*covar*(mean-center)
+                // prob should have *2
+                mult(lm_inv,alpha_grad_vec,step_size_vec);
+                /*
+                for(unsigned i=0;i<ncvs;++i) {
+                    means[i] = 0;
+                    ssds[i] = 0;
+                    set_coupling[i] += step_size_vec[i];
+                    coupling_rate[i] = (set_coupling[i]-current_coupling[i])/update_period;
+                }
+                */
+            } 
 
-               //check if the step_size exceeds maximum possible gradient
-               step_size = copysign(fmin(fabs(step_size), max_coupling_grad[i]), step_size);
-        
-               //reset means/vars
-               means[i] = 0;
-               ssds[i] = 0;
-        
-              //multidimesional stochastic step
-               coupling_accum[i] += step_size * step_size;
-               //equation 5 in White and Voth, JCTC 2014
-               //no negative sign because it's in step_size
-               set_coupling[i] += max_coupling_range[i]/sqrt(coupling_accum[i])*step_size;
-               coupling_rate[i] = (set_coupling[i]-current_coupling[i])/update_period;
-            }
-            covar*=0;
-        
-            update_calls = 0;
-            avg_coupling_count++;
-            equilibration = true; //back to equilibration now
+                for(unsigned i=0;i<ncvs;++i){
+                   //calulcate step size
+                   //double alpha_grad = 0;
+                   //check calculation by compariance std deviation to diagonal elements. Agrees.
+                   //printf("%i %f %f\n",i,ssds[i]/(update_calls-1),covar(i,i));
+                   //for(unsigned j=0;j<ncvs;++j){
+                   //    alpha_grad += (means[j]-center[j])*covar(j,i);
+                   //}
+                   if(lm){
+                       step_size = 2*step_size_vec[i]/kbt/center[i];
+                   } else{
+                       step_size = 2*alpha_grad_vec[i]/kbt/center[i];
+                   }
+                   //don't have to use divided by center, which allows targetting to zero. However, means that rate has to be tuned more carefully for multiple cvs.
+                   //step_size = 2*alpha_grad/kbt;
+    
+                   //check if the step_size exceeds maximum possible gradient
+                   step_size = copysign(fmin(fabs(step_size), max_coupling_grad[i]), step_size);
+            
+                   //reset means/vars
+                   means[i] = 0;
+                   ssds[i] = 0;
+            
+                  //multidimesional stochastic step
+                   coupling_accum[i] += step_size * step_size;
+                   //equation 5 in White and Voth, JCTC 2014
+                   //no negative sign because it's in step_size
+                   set_coupling[i] += max_coupling_range[i]/sqrt(coupling_accum[i])*step_size;
+                   coupling_rate[i] = (set_coupling[i]-current_coupling[i])/update_period;
+                }
+                covar*=0;
+
+                update_calls = 0;
+                avg_coupling_count++;
+                equilibration = true; //back to equilibration now
           } //close update if
 
       }
