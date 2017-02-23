@@ -114,6 +114,7 @@ class EDS : public Bias{
   std::vector<double> differences;
   std::vector<double> alpha_grad_vec;
   std::vector<double> step_size_vec;
+  std::vector<double> past_errors;
   std::vector<Value*> outCoupling;
   std::string _irestartfilename;
   std::string _orestartfilename;
@@ -123,6 +124,7 @@ class EDS : public Bias{
   bool freeze;
   bool simultaneous;
   bool lm;
+  bool lm_adaptive;
   bool equilibration;
   bool ramp;
   bool restart;
@@ -131,9 +133,16 @@ class EDS : public Bias{
   int update_calls;
   int avg_coupling_count;
   int update_period;
+  int lm_adaptive_memory;
+  int lm_adaptive_stride;
+  int error_counter;
   double kbt;
   double coupling_range_increase_factor;
   double lm_mixing_par;
+  double lm_adaptive_factor;
+  double lm_max;
+  double lm_min;
+
   int b_hard_coupling_range;
   Random rand;
   Value* valueBias;
@@ -174,8 +183,12 @@ void EDS::registerKeywords(Keywords& keys){
    keys.addFlag("RAMP",false,"Slowly increase bias constant to a fixed value");
    keys.addFlag("FREEZE",false,"Fix bias at current level (only used for restarting). Can also set PERIOD=0 if not using EDSRESTART.");
    keys.addFlag("SIMULTANEOUS",false,"Adjust bias simultaneously using covariance matrix. Otherwise choose variable randomly.");
+
    keys.addFlag("LM",false,"Use Levenberg-Marquadt algorithm along with simulatneous keyword. Otherwise use gradient descent.");
    keys.addFlag("LM_MIXING","1","Initial mixing parameter when using Levenberg-Marquadt minimization.");
+   keys.addFlag("LM_ADAPTIVE_FACTOR","-1","A value >1 will change Levenberg-Marquadt mixing parameter adaptively to best reduce error on every step.");
+   keys.addFlag("LM_ADAPTIVE_STRIDE","10","This is how many averaging steps will be averaged together and stored for use in adaptive LM algorithm.");
+   keys.addFlag("LM_ADAPTIVE_MEMORY","5","If using adaptive LM algorithm, try to have this many error decreasing steps in a row (the decrease lambda by ADAPTIVE_FACTOR).");
    keys.addFlag("EDSRESTART",false,"Get settings from IRESTARTFILE");
 
    keys.addOutputComponent("bias","default","the instantaneous value of the bias potential");
@@ -203,6 +216,12 @@ update_period(0),
 kbt(0.0),
 coupling_range_increase_factor(1.25),
 lm_mixing_par(1.0),
+lm_adaptive_factor(3.0),
+lm_adaptive_memory(5),
+lm_adaptive_stride(10),
+lm_max(100.0),
+lm_min(0.01),
+error_counter(0),
 b_hard_coupling_range(0),
 adaptive(true),
 equilibration(true),
@@ -210,6 +229,7 @@ ramp(false),
 freeze(false),
 simultaneous(false),
 lm(false),
+lm_adaptive(false),
 restart(false),
 b_write_restart(false),
 seed(0),
@@ -243,6 +263,9 @@ valueForce2(NULL)
   parse("TEMP",temp);
   parse("SEED",seed);
   parse("LM_MIXING",lm_mixing_par);
+  parse("LM_ADAPTIVE_FACTOR",lm_adaptive_factor);
+  parse("LM_ADAPTIVE_STRIDE",lm_adaptive_stride);
+  parse("LM_ADAPTIVE_MEMORY",lm_adaptive_memory);
   parse("ORESTARTFILE",_orestartfilename);
   parseFlag("RAMP",ramp);
   parseFlag("FREEZE",freeze);
@@ -328,7 +351,20 @@ valueForce2(NULL)
             lm_inv*=0;
             covar2.resize(ncvs,ncvs);
             covar2*=0;
-            log.printf("  ...and Levenberg-Marquadt algorithm with initial mixing paramter %f\n",lm_mixing_par);
+            if ( lm_adaptive_factor > 1 ) {
+                log.printf("  ...and /adaptive/ Levenberg-Marquadt algorithm with initial mixing parameter %f\n",lm_mixing_par);
+                if (lm_adaptive_memory>=2) {
+                    log.printf("  ... where lambda is adjusted by a factor of %f if error increases/decreases over %i iterations\n",lm_adaptive_factor,lm_adaptive_memory);
+                }
+                else{
+                    error("Adaptive Levenberg-Marquadt algorithm can only be enabled with error memory >= 2");
+                }
+                lm_adaptive=true;
+                past_errors.resize(lm_adaptive_memory);
+            }
+            else {
+                log.printf("  ...and Levenberg-Marquadt algorithm with initial mixing parameter %f\n",lm_mixing_par);
+            }
         }
     }
     if(lm && ! simultaneous){
@@ -395,7 +431,14 @@ void EDS::read_irestart(){
     std::string coupling_name;
     std::string maxrange_name;
     std::string maxgrad_name;
+
+
     while(irestartfile_.scanField("time",time)){
+    
+        if (irestartfile_.FieldExist("lm_mixing_par")){
+            irestartfile_.scanField("lm_mixing_par",lm_mixing_par);
+
+        }
 
         for(unsigned i=0;i<getNumberOfArguments();++i) {
             center_name = getPntrToArgument(i)->getName()+"_center";
@@ -466,6 +509,9 @@ void EDS::write_orestart(){
     std::string maxrange_name;
     std::string maxgrad_name;
     orestartfile_.printField("time",getTimeStep()*getStep());
+    if(lm_adaptive){
+        orestartfile_.printField("lm_mixing_par",lm_mixing_par);
+    }
 
     for(unsigned i=0;i<getNumberOfArguments();++i) {
         center_name = getPntrToArgument(i)->getName()+"_center";
@@ -588,7 +634,42 @@ void EDS::calculate(){
           if(!equilibration && update_period > 0 && update_calls == update_period && !freeze) {
             double step_size = 0;
             double tmp;
-            for(unsigned i=0;i<ncvs;++i) differences[i]=means[i]-center[i];
+            for(unsigned i=0;i<ncvs;++i) {
+                differences[i]=means[i]-center[i];
+                if(lm_adaptive){
+                    past_errors[error_counter%lm_adaptive_memory] += differences[i]*differences[i]/center[i]/center[i];
+                }
+            }
+            if(lm_adaptive && (avg_coupling_count % lm_adaptive_stride)==0) {
+//                printf("current error : %i %f\n",error_counter%lm_adaptive_memory,past_errors[error_counter%lm_adaptive_memory]);
+
+                if((error_counter%lm_adaptive_memory)==lm_adaptive_memory-1){
+                    //check if error decreases every time
+                    int alter_mixing_par = 0;
+                    for(unsigned m = 1;m<lm_adaptive_memory;m++) {
+//compare average errors, added up over same amount of time
+                        if(past_errors[m]>past_errors[m-1]) {
+                            alter_mixing_par++; 
+                        } else {
+                            alter_mixing_par--; 
+                        }
+                    }
+                    if (alter_mixing_par == -(lm_adaptive_memory-1)) {
+//                        printf("...decreasing mixing par\n");
+                        lm_mixing_par/=lm_adaptive_factor;
+                        lm_mixing_par=fmax(lm_mixing_par,lm_min);
+                    } else if (alter_mixing_par == (lm_adaptive_memory-1)) {
+//                        printf("...increasing mixing par\n");
+                        lm_mixing_par*=lm_adaptive_factor;
+                        lm_mixing_par=fmin(lm_mixing_par,lm_max);
+                    }
+                    error_counter = 0;
+                    for(unsigned m = 0;m<lm_adaptive_memory;m++) past_errors[m]=0;
+                }
+                else{
+                    error_counter++;
+                }
+            }
             mult(covar,differences,alpha_grad_vec);
             if(lm){
                 for(unsigned i=0;i<ncvs;++i) {
